@@ -1,148 +1,186 @@
 """
-Apply a rotation (X/Y/Z Euler angles) around the WORLD ORIGIN to an articulated 
-USD robot. This modifies the CURRENTLY OPENED stage in Isaac Sim.
+Apply a permanent global transformation for Isaac Lab (Root Deformation Baking).
 
-What gets rotated and why
-─────────────────────────
-• Top-level ArticulationRoots, RigidBodies, and Joint Xforms.
-  By revolving the highest-level physics containers around the world origin, 
-  the entire robot is rotated perfectly in world space, exactly as requested.
-  
-• Because all rigid bodies undergo the exact same world-origin rotation, 
-  their relative distances and local coordinate systems remain mathematically 
-  identical. Therefore, joint connection frames (localPos/localRot) are 
-  natively preserved and do NOT need to be modified.
+Because Isaac Lab forces the Root Rigid Body to [1,0,0,0] at runtime, any rotation 
+applied directly to the Root Rigid Body is erased. This script solves this by:
+1. Forcing the Root Rigid Body to Identity.
+2. Baking the rotation into the Visuals/Collisions INSIDE the Root Rigid Body.
+3. Rotating the joint anchor points (localPos/localRot) connected to the Root.
+4. Revolving all child rigid bodies around the origin to match.
+5. Cleans up the USD by physically removing old `rotateXYZ` properties.
 
 Usage:
 1. Open your Rover USD in Isaac Sim.
-2. Ensure the rover is positioned where you want it relative to the origin 
-   (typically you want the robot centered at 0,0,0 before baking a rotation).
-3. Open Window > Script Editor.
-4. Adjust the Configuration block below so +X becomes the forward axis.
-5. Run the script.
-6. Save the file (File > Save).
+2. Open Window > Script Editor.
+3. Run the script.
+4. Save the file.
 """
 
 import omni.usd
-from pxr import Gf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, Usd, UsdGeom, UsdPhysics, Sdf
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# Aligning Rovers to +X Forward:
-# • If the rover currently faces +Y forward, set ROT_Z = -90.0
-# • If the rover currently faces -Y forward, set ROT_Z = 90.0
-# • If the rover currently faces +Z forward, set ROT_Y = 90.0
-# • If the rover currently faces -Z forward, set ROT_Y = -90.0
-
 ROT_X = 0.0
 ROT_Y = 0.0
-ROT_Z = -90.0  # Default correction for a +Y forward rover
+ROT_Z = -90.0  # Correction to make +Y facing rovers face +X forward
+
+TRANS_X = 0.0
+TRANS_Y = 0.0
+TRANS_Z = 0.0
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def build_world_rotation_matrix(rot_x: float, rot_y: float, rot_z: float) -> Gf.Matrix4d:
-    """Compose a 4x4 rotation matrix from X→Y→Z Euler angles (degrees)."""
+def get_global_transform_matrix(rot_x: float, rot_y: float, rot_z: float, 
+                                trans_x: float, trans_y: float, trans_z: float) -> Gf.Matrix4d:
+    """Compose a 4x4 matrix for Rotation followed by Translation."""
     rot = Gf.Rotation(Gf.Vec3d(1, 0, 0), rot_x) * \
           Gf.Rotation(Gf.Vec3d(0, 1, 0), rot_y) * \
           Gf.Rotation(Gf.Vec3d(0, 0, 1), rot_z)
     
-    # Return a 4x4 matrix with pure rotation (no translation)
-    return Gf.Matrix4d(rot, Gf.Vec3d(0, 0, 0))
+    rot_mat = Gf.Matrix4d(rot, Gf.Vec3d(0, 0, 0))
+    trans_mat = Gf.Matrix4d().SetTranslate(Gf.Vec3d(trans_x, trans_y, trans_z))
+    return rot_mat * trans_mat
 
 
-def get_top_level_physics_prims(stage: Usd.Stage):
-    """
-    Finds all top-level physics prims (Articulation Root, RigidBody, or Joint).
-    'Top-level' means they do not have a parent/ancestor that is ALSO in this list. 
-    Rotating just these guarantees all nested sub-components are safely carried along.
-    """
-    targets =[]
-    for prim in stage.Traverse():
-        is_art_root = prim.HasAPI(UsdPhysics.ArticulationRootAPI)
-        is_rb = prim.HasAPI(UsdPhysics.RigidBodyAPI)
-        is_joint = prim.GetAttribute("physics:localPos0").IsValid() or prim.IsA(UsdPhysics.Joint)
-        
-        if is_art_root or is_rb or is_joint:
-            targets.append(prim)
+def set_xform_ops(prim: Usd.Prim, matrix: Gf.Matrix4d):
+    """Safely apply standard Isaac Sim xformOps and physically clean up old ones."""
+    # 1. Strip away legacy orientation properties (like rotateXYZ) to prevent USDA clutter
+    for prop in prim.GetAuthoredProperties():
+        name = prop.GetName()
+        if name.startswith("xformOp:rotate") or name.startswith("xformOp:orient") or name.startswith("xformOp:transform"):
+            prim.RemoveProperty(name)
+
+    xformable = UsdGeom.Xformable(prim)
+    xformable.ClearXformOpOrder()
+    decomp = Gf.Transform(matrix)
     
-    top_level =[]
-    for prim in targets:
-        parent = prim.GetParent()
-        has_target_ancestor = False
-        
-        # Walk up the tree to see if an ancestor is also in our target list
-        while parent and parent.IsValid() and not parent.IsPseudoRoot():
-            if parent in targets:
-                has_target_ancestor = True
-                break
-            parent = parent.GetParent()
-        
-        if not has_target_ancestor:
-            top_level.append(prim)
-            
-    return top_level
+    # 2. Translate (double3)
+    trans = decomp.GetTranslation()
+    xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(Gf.Vec3d(trans))
+    
+    # 3. Orient (quatd) - This is the ONLY rotation component that will be preserved
+    xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(decomp.GetRotation().GetQuat())
+    
+    # 4. Scale (float3)
+    scale = decomp.GetScale()
+    xformable.AddScaleOp(UsdGeom.XformOp.PrecisionFloat).Set(Gf.Vec3f(scale))
 
 
-def apply_world_rotation(rot_x: float, rot_y: float, rot_z: float) -> None:
+def apply_isaac_lab_bake():
     stage = omni.usd.get_context().get_stage()
-    
     if not stage:
-        print("[ERROR] No USD stage is currently open in Isaac Sim.")
+        print("[ERROR] No USD stage is currently open.")
         return
 
-    rot_mat = build_world_rotation_matrix(rot_x, rot_y, rot_z)
-    top_level_prims = get_top_level_physics_prims(stage)
-
-    if not top_level_prims:
-        print("[WARN] No ArticulationRoot, RigidBody, or Joint prims found.")
+    # 1. Identify the Root Rigid Body (Base Link)
+    joints =[j for j in stage.Traverse() if j.IsA(UsdPhysics.Joint) or j.GetAttribute("physics:localPos0")]
+    body1_targets = set()
+    for j in joints:
+        rel = j.GetRelationship("physics:body1")
+        if rel and rel.GetTargets():
+            body1_targets.add(str(rel.GetTargets()[0]))
+            
+    rbs =[p for p in stage.Traverse() if p.HasAPI(UsdPhysics.RigidBodyAPI)]
+    root_rb = None
+    for rb in rbs:
+        # The true base link is the rigid body that has NO incoming joints (never body1)
+        if str(rb.GetPath()) not in body1_targets:
+            root_rb = rb
+            break
+            
+    if not root_rb:
+        print("[ERROR] Could not identify the Root Rigid Body. Ensure physics relationships are valid.")
         return
+        
+    print(f"[INFO] Identified Root Rigid Body: {root_rb.GetPath()}")
 
-    # Use XformCache to accurately read current world transforms
     xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    M_global = get_global_transform_matrix(ROT_X, ROT_Y, ROT_Z, TRANS_X, TRANS_Y, TRANS_Z)
+    
+    # We will force root_rb to be Identity relative to its parent.
+    root_W_old = xform_cache.GetLocalToWorldTransform(root_rb)
+    parent = root_rb.GetParent()
+    parent_W = xform_cache.GetLocalToWorldTransform(parent) if parent else Gf.Matrix4d(1.0)
+    W_root_new = parent_W 
+    
+    child_L_new = {}
+    joint_updates =[]
+    rb_L_new = {}
 
-    # Wrap in an undo block so you can Ctrl+Z in Isaac Sim if the rotation is wrong
+    # --- PRE-CALCULATE ALL MATHEMATICS BEFORE EDITING USD ---
+
+    # A. Visuals & Collisions INSIDE the Root Rigid Body
+    for child in root_rb.GetChildren():
+        if child.IsA(UsdGeom.Xformable):
+            W_child_old = xform_cache.GetLocalToWorldTransform(child)
+            W_child_new = W_child_old * M_global
+            child_L_new[child.GetPath()] = W_child_new * W_root_new.GetInverse()
+
+    # B. Joint Anchors attached to the Root Rigid Body
+    for j in joints:
+        for side in ['0', '1']:
+            rel = j.GetRelationship(f"physics:body{side}")
+            if rel and rel.GetTargets() and str(rel.GetTargets()[0]) == str(root_rb.GetPath()):
+                pos_attr = j.GetAttribute(f"physics:localPos{side}")
+                rot_attr = j.GetAttribute(f"physics:localRot{side}")
+                
+                pos = pos_attr.Get() if (pos_attr and pos_attr.IsValid()) else Gf.Vec3f(0.0)
+                rot = rot_attr.Get() if (rot_attr and rot_attr.IsValid()) else Gf.Quatf(1.0)
+                
+                # Transform the joint anchor to global, rotate it, bring it back to new local
+                L_anchor_old = Gf.Matrix4d(Gf.Rotation(Gf.Quatd(rot)), Gf.Vec3d(pos))
+                W_anchor_old = L_anchor_old * root_W_old
+                W_anchor_new = W_anchor_old * M_global
+                L_anchor_new = W_anchor_new * W_root_new.GetInverse()
+                
+                decomp = Gf.Transform(L_anchor_new)
+                joint_updates.append((j, side, decomp.GetTranslation(), decomp.GetRotation().GetQuat()))
+
+    # C. All OTHER Rigid Bodies (Child Links)
+    other_rbs =[rb for rb in rbs if rb != root_rb]
+    for rb in other_rbs:
+        W_rb_old = xform_cache.GetLocalToWorldTransform(rb)
+        W_rb_new = W_rb_old * M_global
+        
+        p_rb = rb.GetParent()
+        p_W_old = xform_cache.GetLocalToWorldTransform(p_rb) if p_rb else Gf.Matrix4d(1.0)
+        rb_L_new[rb.GetPath()] = W_rb_new * p_W_old.GetInverse()
+
+
+    # --- APPLY ALL MATHEMATICS SAFELY ---
     with omni.kit.undo.group():
-        for prim in top_level_prims:
-            xformable = UsdGeom.Xformable(prim)
-            if not xformable:
-                continue
+        
+        # 1. Update geometry inside the root link
+        for path, L_mat in child_L_new.items():
+            set_xform_ops(stage.GetPrimAtPath(path), L_mat)
+            print(f"[Rotated Visuals] {path}")
             
-            # 1. Get the current world transform
-            world_transform = xform_cache.GetLocalToWorldTransform(prim)
+        # 2. Update child rigid bodies
+        for path, L_mat in rb_L_new.items():
+            set_xform_ops(stage.GetPrimAtPath(path), L_mat)
+            print(f"[Revolved Link] {path}")
             
-            # 2. Revolve/Rotate around the world origin
-            # In USD (row-vector math), multiplying the world matrix by a rotation matrix 
-            # applies that rotation globally around 0,0,0.
-            new_world_transform = world_transform * rot_mat
+        # 3. Update Joint Anchors attached to Root
+        for j, side, new_pos, new_rot in joint_updates:
+            # Enforce strict float precision for joints
+            pos_attr = j.GetAttribute(f"physics:localPos{side}")
+            if not pos_attr:
+                pos_attr = j.CreateAttribute(f"physics:localPos{side}", Sdf.ValueTypeNames.Point3f)
+            pos_attr.Set(Gf.Vec3f(new_pos))
             
-            # 3. Compute the new local transform to maintain safe parent/child hierarchy
-            parent = prim.GetParent()
-            if parent and not parent.IsPseudoRoot():
-                parent_world = xform_cache.GetLocalToWorldTransform(parent)
-            else:
-                parent_world = Gf.Matrix4d(1.0)
-            
-            # Local = World * Parent_World_Inverse
-            parent_world_inv = parent_world.GetInverse()
-            new_local_transform = new_world_transform * parent_world_inv
-            
-            # 4. Decompose the matrix into standard Translation, Rotation, and Scale
-            decomposed = Gf.Transform(new_local_transform)
-            
-            # 5. Apply standard operations. Clearing first ensures custom/weird pivots 
-            # from URDF imports don't corrupt the rotation math.
-            xformable.ClearXformOpOrder()
-            xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble).Set(decomposed.GetTranslation())
-            xformable.AddOrientOp(UsdGeom.XformOp.PrecisionDouble).Set(decomposed.GetRotation().GetQuat())
-            xformable.AddScaleOp(UsdGeom.XformOp.PrecisionDouble).Set(decomposed.GetScale())
-            
-            print(f"[Rotated] {prim.GetPath()}")
+            rot_attr = j.GetAttribute(f"physics:localRot{side}")
+            if not rot_attr:
+                rot_attr = j.CreateAttribute(f"physics:localRot{side}", Sdf.ValueTypeNames.Quatf)
+            rot_attr.Set(Gf.Quatf(new_rot))
+            print(f"[Rotated Joint Anchor] {j.GetPath()} (side {side})")
 
-    print(
-        f"\nDone applying world-origin rotation to active stage.\n"
-        f"  Total root objects rotated: {len(top_level_prims)}\n"
-        f"  Rotation Applied: X={rot_x}°  Y={rot_y}°  Z={rot_z}°\n\n"
-        f"You can now inspect the changes. If correct, go to File > Save."
-    )
+        # 4. FORCE the Root Rigid Body to Identity (Zeroing it out for Isaac Lab)
+        set_xform_ops(root_rb, Gf.Matrix4d(1.0))
+        print(f"[Zeroed Root Link] {root_rb.GetPath()}")
+
+    print("\n--- DONE ---")
+    print("The robot's default orientation is perfectly baked for Isaac Lab.")
+    print("You can now safely spawn this robot with an Identity state[1, 0, 0, 0] and it will face +X.")
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-apply_world_rotation(ROT_X, ROT_Y, ROT_Z)
+apply_isaac_lab_bake()
