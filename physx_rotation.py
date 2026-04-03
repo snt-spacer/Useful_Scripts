@@ -33,7 +33,7 @@ from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 INPUT_PATH  = "C:/IsaacLab/source/isaaclab_assets/data/Robots/SpaceR-TheDreamLab/UniluFP_RL/unilu_FP_pingu.usd"
-OUTPUT_PATH = "C:/IsaacLab/source/isaaclab_assets/data/Robots/SpaceR-TheDreamLab/UniluFP_RL/newwwwww.usd"
+OUTPUT_PATH = "C:/IsaacLab/source/isaaclab_assets/data/Robots/SpaceR-TheDreamLab/UniluFP_RL/unilu_FP_pingu_rotated.usd"
 
 # Rotation in degrees applied around each axis (order: X → Y → Z)
 ROT_X = 0.0
